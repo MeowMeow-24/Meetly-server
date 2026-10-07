@@ -10,13 +10,19 @@ types.setTypeParser(1082, (v) => v);            // DATE → 'YYYY-MM-DD'
 types.setTypeParser(1700, (v) => parseFloat(v)); // NUMERIC → number
 
 const {
-  DATABASE_URL, PGSSL, PORT = 3000,
+  DATABASE_URL, PORT = 3000,
   JWT_SECRET = 'dev-secret-change-me',
   GOOGLE_CLIENT_ID = '593161598887-sdk2tei3d7unugpurlq8tkjmpbmv691u.apps.googleusercontent.com',
   ALLOWED_DOMAIN = 'udru.ac.th', ADMIN_EMAILS = '', DEMO_LOGIN = 'false', SEED = 'true', ALLOW_PIN_SIGNUP = 'true',
 } = process.env;
 
-const db = new Pool({ connectionString: DATABASE_URL, ssl: PGSSL === 'true' ? { rejectUnauthorized: false } : undefined });
+// ตรวจสอบว่าถ้าไม่ใช่ localhost ให้เปิด SSL rejectUnauthorized: false อัตโนมัติ
+const isProduction = DATABASE_URL && !DATABASE_URL.includes('localhost') && !DATABASE_URL.includes('127.0.0.1');
+
+const db = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: isProduction ? { rejectUnauthorized: false } : undefined,
+});
 const gClient = new OAuth2Client();
 
 // ───────── schema (ชื่อคอลัมน์ตรงกับหัวชีตเดิม นำเข้า CSV ได้ตรงๆ) ─────────
