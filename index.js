@@ -4,6 +4,7 @@ const crypto = require('crypto');
 const { Pool, types } = require('pg');
 const jwt = require('jsonwebtoken');
 const { OAuth2Client } = require('google-auth-library');
+const scrypt = require('util').promisify(crypto.scrypt);
 
 types.setTypeParser(1082, (v) => v);            // DATE → 'YYYY-MM-DD'
 types.setTypeParser(1700, (v) => parseFloat(v)); // NUMERIC → number
@@ -12,7 +13,7 @@ const {
   DATABASE_URL, PGSSL, PORT = 3000,
   JWT_SECRET = 'dev-secret-change-me',
   GOOGLE_CLIENT_ID = '593161598887-sdk2tei3d7unugpurlq8tkjmpbmv691u.apps.googleusercontent.com',
-  ALLOWED_DOMAIN = 'udru.ac.th', ADMIN_EMAILS = '', DEMO_LOGIN = 'false', SEED = 'true',
+  ALLOWED_DOMAIN = 'udru.ac.th', ADMIN_EMAILS = '', DEMO_LOGIN = 'false', SEED = 'true', ALLOW_PIN_SIGNUP = 'true',
 } = process.env;
 
 const db = new Pool({ connectionString: DATABASE_URL, ssl: PGSSL === 'true' ? { rejectUnauthorized: false } : undefined });
@@ -23,6 +24,10 @@ const SCHEMA = `
 CREATE TABLE IF NOT EXISTS "Users"(
   "Email" TEXT PRIMARY KEY, "FullName" TEXT NOT NULL, "Status" TEXT, "Faculty" TEXT, "Major" TEXT, "Phone" TEXT,
   "Role" TEXT NOT NULL DEFAULT 'user', "CreatedAt" TIMESTAMPTZ DEFAULT now());
+ALTER TABLE "Users" ADD COLUMN IF NOT EXISTS "AuthType" TEXT NOT NULL DEFAULT 'google';
+ALTER TABLE "Users" ADD COLUMN IF NOT EXISTS "PinHash" TEXT;
+ALTER TABLE "Users" ADD COLUMN IF NOT EXISTS "FailCount" INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE "Users" ADD COLUMN IF NOT EXISTS "LockedUntil" TIMESTAMPTZ;
 CREATE TABLE IF NOT EXISTS "Rooms"(
   "RoomID" TEXT PRIMARY KEY, "RoomName" TEXT NOT NULL, "Capacity" INTEGER DEFAULT 1, "PricePerRound" NUMERIC(10,2) DEFAULT 0,
   "Status" TEXT DEFAULT 'active', "Location" TEXT DEFAULT '', "Equipment" TEXT DEFAULT '', "Description" TEXT DEFAULT '');
@@ -39,10 +44,30 @@ const toMin = (t) => { const [h, m] = t.split(':').map(Number); return h * 60 + 
 const addDays = (d, n) => { const x = new Date(d + 'T00:00:00Z'); x.setUTCDate(x.getUTCDate() + n); return x.toISOString().slice(0, 10); };
 const rid = (p) => p + crypto.randomBytes(4).toString('hex').toUpperCase();
 const sign = (email) => jwt.sign({ email }, JWT_SECRET, { expiresIn: '30d' });
-const pubUser = (u) => ({ Email: u.Email, FullName: u.FullName, Status: u.Status, Faculty: u.Faculty, Major: u.Major, Phone: u.Phone, Role: u.Role });
+const pubUser = (u) => ({ Email: u.Email, FullName: u.FullName, Status: u.Status, Faculty: u.Faculty, Major: u.Major, Phone: u.Phone, Role: u.Role, AuthType: u.AuthType });
 const isAdminEmail = (e) => ADMIN_EMAILS.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean).includes(String(e).toLowerCase());
 const needUser = (u) => u || fail('กรุณาเข้าสู่ระบบ');
 const needAdmin = (u) => (needUser(u).Role === 'admin' ? u : fail('เฉพาะผู้ดูแลระบบเท่านั้น'));
+
+// ───────── PIN 6 หลัก (บัญชีที่ไม่ใช้ Google) ─────────
+const normPhone = (p) => String(p || '').replace(/[\s-]/g, '');
+const phoneEmail = (p) => `${p}@pin.local`; // ใช้เป็นตัวระบุผู้ใช้ภายใน ให้เข้ากับตารางเดิม
+const weakPin = (p) => /^(\d)\1{5}$/.test(p) || '0123456789'.includes(p) || '9876543210'.includes(p);
+function checkPinFormat(pin) {
+  if (!/^\d{6}$/.test(String(pin || ''))) fail('PIN ต้องเป็นตัวเลข 6 หลัก');
+  if (weakPin(String(pin))) fail('PIN เดาง่ายเกินไป (เช่น 123456 หรือเลขซ้ำ) กรุณาตั้งใหม่');
+}
+async function hashPin(pin) {
+  const salt = crypto.randomBytes(16);
+  return salt.toString('hex') + ':' + (await scrypt(String(pin), salt, 32)).toString('hex');
+}
+async function verifyPin(pin, stored) {
+  if (!stored) return false;
+  const [salt, hash] = stored.split(':');
+  const got = await scrypt(String(pin), Buffer.from(salt, 'hex'), 32), want = Buffer.from(hash, 'hex');
+  return got.length === want.length && crypto.timingSafeEqual(got, want);
+}
+const MAX_TRIES = 5;
 
 function bkk() { // เวลาไทย (เซิร์ฟเวอร์ Railway เป็น UTC)
   const p = Object.fromEntries(new Intl.DateTimeFormat('en-CA', {
@@ -118,13 +143,56 @@ const actions = {
     return { success: true, user: pubUser(u), token: sign(email) };
   },
 
+  async pinRegister({ body }) {
+    if (ALLOW_PIN_SIGNUP !== 'true') fail('ขณะนี้ปิดรับสมัครด้วย PIN');
+    const phone = normPhone(body.phone);
+    const { fullName, status, faculty, major } = body;
+    if (![fullName, status, faculty, major].every((v) => String(v || '').trim())) fail('กรุณากรอกข้อมูลให้ครบ');
+    if (!/^0\d{9}$/.test(phone)) fail('เบอร์โทรศัพท์ต้องเป็นตัวเลข 10 หลัก ขึ้นต้นด้วย 0');
+    checkPinFormat(body.pin);
+    const r = await db.query(
+      `INSERT INTO "Users"("Email","FullName","Status","Faculty","Major","Phone","Role","AuthType","PinHash") VALUES($1,$2,$3,$4,$5,$6,'user','pin',$7)
+       ON CONFLICT("Email") DO NOTHING RETURNING *`,
+      [phoneEmail(phone), fullName.trim(), status, faculty.trim(), major.trim(), phone, await hashPin(body.pin)]);
+    if (!r.rows[0]) fail('เบอร์นี้สมัครไว้แล้ว กรุณาเข้าสู่ระบบ');
+    return { success: true, user: pubUser(r.rows[0]), token: sign(r.rows[0].Email) };
+  },
+
+  async pinLogin({ body }) {
+    const bad = 'เบอร์โทรหรือ PIN ไม่ถูกต้อง';
+    const u = (await db.query('SELECT * FROM "Users" WHERE "Email"=$1 AND "AuthType"=\'pin\'', [phoneEmail(normPhone(body.phone))])).rows[0];
+    if (!u) fail(bad);
+    if (u.LockedUntil && new Date(u.LockedUntil) > new Date()) {
+      fail(`ใส่ PIN ผิดหลายครั้ง กรุณาลองใหม่ในอีก ${Math.ceil((new Date(u.LockedUntil) - Date.now()) / 60000)} นาที`);
+    }
+    if (!(await verifyPin(body.pin, u.PinHash))) {
+      const n = (await db.query('UPDATE "Users" SET "FailCount"="FailCount"+1 WHERE "Email"=$1 RETURNING "FailCount"', [u.Email])).rows[0].FailCount;
+      if (n >= MAX_TRIES) {
+        await db.query('UPDATE "Users" SET "FailCount"=0,"LockedUntil"=now()+interval \'15 minutes\' WHERE "Email"=$1', [u.Email]);
+        fail(`ใส่ PIN ผิดครบ ${MAX_TRIES} ครั้ง ระบบล็อกบัญชี 15 นาที`);
+      }
+      fail(`${bad} (เหลืออีก ${MAX_TRIES - n} ครั้ง)`);
+    }
+    await db.query('UPDATE "Users" SET "FailCount"=0,"LockedUntil"=NULL WHERE "Email"=$1', [u.Email]);
+    return { success: true, user: pubUser(u), token: sign(u.Email) };
+  },
+
+  async changePin({ user, body }) {
+    needUser(user);
+    if (user.AuthType !== 'pin') fail('บัญชี Google ไม่มี PIN');
+    if (!(await verifyPin(body.oldPin, user.PinHash))) fail('PIN เดิมไม่ถูกต้อง');
+    checkPinFormat(body.newPin);
+    await db.query('UPDATE "Users" SET "PinHash"=$2 WHERE "Email"=$1', [user.Email, await hashPin(body.newPin)]);
+    return { success: true };
+  },
+
   async updateProfile({ user, body }) {
     needUser(user);
     const { FullName, Status, Phone, Faculty, Major } = body;
     if (![FullName, Status, Phone, Faculty, Major].every((v) => String(v || '').trim())) fail('กรุณากรอกข้อมูลให้ครบ');
     const u = (await db.query(
       'UPDATE "Users" SET "FullName"=$2,"Status"=$3,"Phone"=$4,"Faculty"=$5,"Major"=$6 WHERE "Email"=$1 RETURNING *',
-      [user.Email, FullName.trim(), Status, Phone.trim(), Faculty.trim(), Major.trim()])).rows[0];
+      [user.Email, FullName.trim(), Status, user.AuthType === 'pin' ? user.Phone : Phone.trim(), Faculty.trim(), Major.trim()])).rows[0];
     return { success: true, user: pubUser(u) };
   },
 
